@@ -1,0 +1,77 @@
+name: Deploy Biztali Landing Page
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: landing-biztali-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Next.js app
+        run: npm run build
+
+      - name: Prepare standalone deployment bundle
+        run: |
+          mkdir -p .next/standalone/public .next/standalone/.next/static
+          cp -R public/. .next/standalone/public/
+          cp -R .next/static/. .next/standalone/.next/static/
+          tar -czf deployment-bundle.tar.gz -C .next/standalone .
+
+      - name: Upload bundle to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          source: deployment-bundle.tar.gz
+          target: /tmp
+
+      - name: Extract bundle and restart app
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+            TARGET_DIR="/var/www/biztali/landing_biztali"
+            TMP_EXTRACT="/tmp/landing_biztali_deploy_$(date +%s)"
+
+            sudo mkdir -p "$TARGET_DIR"
+            sudo chown -R "$USER:$USER" "$TARGET_DIR"
+            mkdir -p "$TMP_EXTRACT"
+            tar -xzf /tmp/deployment-bundle.tar.gz -C "$TMP_EXTRACT"
+            rsync -av --delete "$TMP_EXTRACT/" "$TARGET_DIR/"
+            rm -rf "$TMP_EXTRACT" /tmp/deployment-bundle.tar.gz
+
+            cd "$TARGET_DIR"
+            if pm2 describe biztali-landing >/dev/null 2>&1; then
+              PORT=3003 pm2 restart biztali-landing --update-env
+            else
+              PORT=3003 pm2 start server.js --name biztali-landing
+            fi
+            pm2 save
+            sudo systemctl reload nginx
